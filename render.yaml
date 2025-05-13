@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: mobile-rag-python
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python product_rag.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.9

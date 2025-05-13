@@ -90,9 +90,9 @@ def setup_rag_pipeline(vector_store):
     return rag_chain
 
 # Main function to initialize the product chatbot
-def initialize_product_chatbot(csv_path):
+def initialize_product_chatbot(json_path):
     # Load and process product data
-    documents = load_product_data(csv_path)
+    documents = load_product_data(json_path)
     if not documents:
         raise Exception("Failed to load product data")
     
@@ -148,4 +148,4 @@ if __name__ == "__main__":
             
     except Exception as e:
         print(f"\nError initializing Product Assistant: {e}")
-        print("Please check if the CSV file exists and contains valid smartphone data.")
+        print("Please check if the JSON file exists and contains valid smartphone data.")
