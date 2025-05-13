@@ -4,3 +4,4 @@ langchain-google-genai
 faiss-cpu
 python-dotenv
 csv
+jq

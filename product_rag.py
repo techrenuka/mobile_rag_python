@@ -1,4 +1,4 @@
-from langchain_community.document_loaders.csv_loader import CSVLoader
+from langchain_community.document_loaders.json_loader import JSONLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import PromptTemplate, ChatPromptTemplate, MessagesPlaceholder
@@ -10,11 +10,15 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Step 1: Load and Process CSV Data
-csv_path = '13.Rag/mobile/smartphone_cleaned_v5.csv'
+# Step 1: Load and Process JSON Data
+json_path = 'smartphones_usd_rounded.json'
 
-def load_product_data(csv_path):
-    loader = CSVLoader(file_path=csv_path)
+def load_product_data(json_path):
+    loader = JSONLoader(
+        file_path=json_path,
+        jq_schema='.',  # Add this line to specify the root JSON path
+        text_content=False
+    )
     documents = loader.load()
     # Extract text content from documents
     text_content = [doc.page_content for doc in documents]
@@ -43,22 +47,29 @@ def setup_rag_pipeline(vector_store):
     )
     
     prompt = ChatPromptTemplate.from_messages([
-        ("system", """You are a helpful product assistant.
-        Answer questions based ONLY on the provided product information.
-        If asked for recommendations, analyze the product features and suggest the best matches.
-        If you can't find relevant information, politely say so.
-        
-        Instructions:
-        - For general queries: Provide accurate information from the product database
-        - For recommendations: Consider features, price range, and category
-        - Always mention key product details in your response
-        - If suggesting alternatives, explain why they're recommended
-        - Use the chat history to provide more contextual and relevant responses
-        
-        Product Information:
-        {context}"""),
-        MessagesPlaceholder(variable_name="chat_history"),
-        ("human", "{question}")
+        ("system", """You are a helpful mobile product assistant.
+                    Answer questions based ONLY on the provided mobile product information.
+                    If asked for recommendations, analyze the mobile specs and user preferences to suggest the best matches.
+                    If you can't find relevant information, politely say so.
+
+                    Instructions:
+                    - For general queries:
+                        Provide accurate details based on the mobile product database (e.g., specs, features, pricing, availability).
+
+                    - For recommendations:
+                        Consider key factors such as performance, camera, battery life, display, storage, price range, and user needs (e.g., gaming, photography, basic use).
+
+                    - Always include key mobile specifications in your responses (e.g., processor, RAM, storage, camera setup, battery, display size/type, OS version).
+
+                    - If suggesting alternatives, clearly explain why they are recommended (e.g., better camera for photography, larger battery for heavy users, more storage for app usage).
+
+                    - If product info is missing or not available, politely inform the user.
+
+                    - If a product is not available in the desired price range, suggest alternatives or suggest a different product.
+                        Product Information:
+                        {context}"""),
+                        MessagesPlaceholder(variable_name="chat_history"),
+                        ("human", "{question}")
     ])
     
     def format_docs(docs):
@@ -101,12 +112,12 @@ def initialize_product_chatbot(csv_path):
 
 # Example usage
 if __name__ == "__main__":
-    # Use the correct CSV file path
-    csv_path = '13.Rag/mobile/smartphone_cleaned_v5.csv'
+    # Use the correct JSON file path
+    json_path = 'smartphones_usd_rounded.json'
     
     try:
         # Initialize the chatbot and chat history
-        chatbot, chat_history = initialize_product_chatbot(csv_path)
+        chatbot, chat_history = initialize_product_chatbot(json_path)
         
         print("Product Assistant initialized! Ask questions about products or request recommendations.")
         print("Example queries:")
