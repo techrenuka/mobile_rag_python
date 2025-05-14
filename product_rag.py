@@ -48,6 +48,7 @@ app.add_middleware(
 # Pydantic model for request body
 class QuestionRequest(BaseModel):
     question: str
+    chat_history: list[dict] = []  # Add this field to store chat history
 
 # Load smartphone product data
 def load_smartphone_data():
@@ -113,6 +114,9 @@ def setup_rag_pipeline(vector_store):
 
             Your role is to help users find information about smartphones, compare different models, and make informed purchasing decisions. Use only the information provided to you through the context documents retrieved from the knowledge base. If you don't have enough information to answer a question, politely acknowledge the limitations and provide the best information you have available.
 
+            Previous conversation history:
+            {chat_history}
+
             Be clear, professional, and helpful in tone. Avoid guessing or fabricating answers. Always prioritize accuracy and relevance. If the question is unrelated to smartphones or mobile products, kindly redirect the user back to relevant topics.
 
             Examples of what you should be able to help with:
@@ -132,16 +136,25 @@ def setup_rag_pipeline(vector_store):
         
         Question: {question}
         """,
-        input_variables=['context', 'question']
+        input_variables=['context', 'question', 'chat_history']
     )
     
     def format_docs(docs):
         return "\n\n".join(doc.page_content for doc in docs)
     
+    def format_chat_history(chat_history):
+        if not chat_history:
+            return "No previous conversation."
+        formatted_history = []
+        for entry in chat_history:
+            formatted_history.append(f"Human: {entry['question']}\nAssistant: {entry['answer']}")
+        return "\n\n".join(formatted_history)
+    
     rag_chain = (
         RunnableParallel({
             'context': retriever | RunnableLambda(format_docs),
-            'question': RunnablePassthrough()
+            'question': RunnablePassthrough(),
+            'chat_history': RunnableLambda(format_chat_history)
         })
         | prompt
         | llm
@@ -221,17 +234,32 @@ def generate_audio_response(text):
 async def ask_question(request: QuestionRequest):
     try:
         question = request.question
+        chat_history = request.chat_history
         
         # Get answer using the pre-initialized RAG chain
-        answer = rag_chain.invoke(question)
+        answer = rag_chain.invoke({
+            'question': question,
+            'chat_history': chat_history
+        })
         
         # Generate audio response
         audio_filename = generate_audio_response(answer)
         
+        # Add current Q&A to chat history
+        chat_history.append({
+            'question': question,
+            'answer': answer
+        })
+        
+        # Keep only last 5 conversations to maintain context window
+        if len(chat_history) > 5:
+            chat_history = chat_history[-5:]
+        
         response = {
             "question": question,
             "answer": answer,
-            "audio_file": audio_filename
+            "audio_file": audio_filename,
+            "chat_history": chat_history
         }
         
         return response
