@@ -142,7 +142,8 @@ def setup_rag_pipeline(vector_store):
     def format_docs(docs):
         return "\n\n".join(doc.page_content for doc in docs)
     
-    def format_chat_history(chat_history):
+    def format_chat_history(inputs):
+        chat_history = inputs.get('chat_history', [])
         if not chat_history:
             return "No previous conversation."
         formatted_history = []
@@ -152,9 +153,9 @@ def setup_rag_pipeline(vector_store):
     
     rag_chain = (
         RunnableParallel({
-            'context': retriever | RunnableLambda(format_docs),
+            'context': {'question': RunnablePassthrough()} | retriever | RunnableLambda(format_docs),
             'question': RunnablePassthrough(),
-            'chat_history': RunnableLambda(format_chat_history)
+            'chat_history': RunnablePassthrough()
         })
         | prompt
         | llm
@@ -234,7 +235,7 @@ def generate_audio_response(text):
 async def ask_question(request: QuestionRequest):
     try:
         question = request.question
-        chat_history = request.chat_history
+        chat_history = request.chat_history or []
         
         # Get answer using the pre-initialized RAG chain
         answer = rag_chain.invoke({
@@ -265,6 +266,7 @@ async def ask_question(request: QuestionRequest):
         return response
     
     except Exception as e:
+        print(f"Error in ask_question: {str(e)}")  # Add logging for debugging
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 # Root endpoint
