@@ -106,7 +106,7 @@ def create_vector_store(documents):
 def setup_rag_pipeline(vector_store):
     retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 5})
     
-    llm = model # Your ChatXAI model
+    llm = model
     
     prompt = PromptTemplate(
         template="""You are MobileExpert AI, a smartphone product specialist.
@@ -115,56 +115,22 @@ def setup_rag_pipeline(vector_store):
 
             Be clear, professional, and helpful in tone. Avoid guessing or fabricating answers. Always prioritize accuracy and relevance. If the question is unrelated to smartphones or mobile products, kindly redirect the user back to relevant topics.
 
-            IMPORTANT: When you are providing a list of specific smartphone models as recommendations or comparisons, you MUST format the product details within a special JSON block.
-            The JSON block should start with "[[PRODUCT_JSON_START]]" and end with "[[PRODUCT_JSON_END]]".
-            Inside this block, provide an array of JSON objects, where each object represents a smartphone.
-            Each smartphone object in the JSON array should include ONLY these keys from the context: "brand_name", "model", "price", "rating", "processor_brand", "ram_capacity", "internal_memory", "screen_size", "has_5g", "has_nfc".
-            Format the price as a number, not a string with '$'. For boolean values like 'has_5g', use true/false.
+            Examples of what you should be able to help with:
+            - Providing detailed specifications of specific smartphone models
+            - Comparing features between different smartphones
+            - Recommending phones based on specific requirements (price range, camera quality, battery life, etc.)
+            - Explaining technical terms related to smartphones
+            - Suggesting alternatives to specific models
 
-            Example of how to include product JSON:
-            User asks: "Suggest some good gaming phones under $500"
-            Your response might be:
-            "Okay, based on your budget, here are a couple of gaming phones I can recommend:
-            [[PRODUCT_JSON_START]]
-            [
-              {
-                "brand_name": "Xiaomi",
-                "model": "Poco X6 Pro",
-                "price": 350,
-                "rating": 88.0,
-                "processor_brand": "MediaTek",
-                "ram_capacity": 8,
-                "internal_memory": 256,
-                "screen_size": 6.67,
-                "has_5g": true,
-                "has_nfc": true
-              },
-              {
-                "brand_name": "Realme",
-                "model": "GT Neo 5 SE",
-                "price": 400,
-                "rating": 87.0,
-                "processor_brand": "Snapdragon",
-                "ram_capacity": 12,
-                "internal_memory": 256,
-                "screen_size": 6.74,
-                "has_5g": true,
-                "has_nfc": true
-              }
-            ]
-            [[PRODUCT_JSON_END]]
-            These offer great performance for their price. Let me know if you want more details on any of these!"
+            Never reveal that you are an AI language model. Act like a real-time mobile product expert.
 
-            If the question is not relevant to smartphone products, respond with:
-                  "I'm specialized in smartphone information. Please ask me about mobile phones, their features, or comparisons between models." And DO NOT include any PRODUCT_JSON block.
-
-            If you are giving a general textual answer without specific product listings, DO NOT include the PRODUCT_JSON block. Only include it when listing specific models.
-
-            Context from smartphone database:
-            {context}
-            
-            Question: {question}
-            Answer:
+            NOTE: If the question is not relevant to smartphone products, respond with:
+                  "I'm specialized in smartphone information. Please ask me about mobile phones, their features, or comparisons between models."
+        
+        Context from smartphone database:
+        {context}
+        
+        Question: {question}
         """,
         input_variables=['context', 'question']
     )
@@ -256,53 +222,22 @@ async def ask_question(request: QuestionRequest):
     try:
         question = request.question
         
-        # Get raw answer string from the RAG chain
-        raw_answer_from_llm = rag_chain.invoke(question)
+        # Get answer using the pre-initialized RAG chain
+        answer = rag_chain.invoke(question)
         
-        products_data = []
-        final_answer_text = raw_answer_from_llm
-
-        # Try to extract product JSON if present
-        start_marker = "[[PRODUCT_JSON_START]]"
-        end_marker = "[[PRODUCT_JSON_END]]"
+        # Generate audio response
+        audio_filename = generate_audio_response(answer)
         
-        start_index = raw_answer_from_llm.find(start_marker)
-        end_index = raw_answer_from_llm.find(end_marker)
-        
-        if start_index != -1 and end_index != -1 and start_index < end_index:
-            json_block_str = raw_answer_from_llm[start_index + len(start_marker):end_index].strip()
-            try:
-                # Attempt to fix common JSON issues before parsing
-                # e.g. ensuring boolean true/false are lowercase (Python's json.loads expects this)
-                json_block_str = json_block_str.replace("True", "true").replace("False", "false")
-                products_data = json.loads(json_block_str)
-                
-                # Clean the raw answer by removing the JSON block and markers
-                final_answer_text = (raw_answer_from_llm[:start_index].strip() + " " + raw_answer_from_llm[end_index + len(end_marker):].strip()).strip()
-                if not final_answer_text.strip(): # If only whitespace remains
-                    final_answer_text = "Here are some products based on your query:" 
-            except json.JSONDecodeError as e:
-                print(f"Warning: Could not parse product JSON: {e}. JSON string was: '{json_block_str}'")
-                # Keep final_answer_text as raw_answer_from_llm if JSON is critical and failed.
-                # Or, if you want to try to salvage text part even if JSON fails:
-                # final_answer_text = (raw_answer_from_llm[:start_index].strip() + " [Error displaying product details] " + raw_answer_from_llm[end_index + len(end_marker):].strip()).strip()
-
-
-        # Generate audio response using the final_answer_text
-        audio_filename = generate_audio_response(final_answer_text)
-        
-        response_payload = {
+        response = {
             "question": question,
-            "answer": final_answer_text,
-            "products": products_data,  # Add the new products field
+            "answer": answer,
             "audio_file": audio_filename
         }
         
-        return response_payload
+        return response
     
     except Exception as e:
-        print(f"Error in /ask endpoint: {str(e)}") 
-        raise HTTPException(status_code=500, detail=f"Error processing your request: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 # Root endpoint
 @app.get("/")
