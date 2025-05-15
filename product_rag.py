@@ -66,13 +66,18 @@ def format_docs(docs):
 
 # Updated Prompt Template
 prompt = PromptTemplate(
-    template="""You are MobileExpert AI, a smartphone product specialist. Help users find phones from the catalog.
+    template="""You are MobileExpert AI, a smartphone product specialist. Help users find phones from the catalog or answer general questions about smartphones.
 
 Context:
 {context}
 
-Respond in JSON format with the following structure:
+Analyze the question to determine if it's:
+1. A product search request (e.g., "show me phones under $500", "best gaming phones", etc.)
+2. A general question about phone features, specifications, or technology
+
+For product search requests, respond in JSON format with the following structure:
 {{
+    "type": "product_search",
     "message": "Here are the best phones under $500...",
     "products": [
         {{
@@ -87,7 +92,11 @@ Respond in JSON format with the following structure:
     ]
 }}
 
-If the query specifies a different price range or criteria, adjust the message to reflect the query (e.g., "Here are the best phones under [price]...").
+For general questions, respond in JSON format with:
+{{
+    "type": "general_info",
+    "message": "Your detailed answer about the phone or technology..."
+}}
 
 Question: {question}
 """,
@@ -141,24 +150,44 @@ async def ask_question(request: QuestionRequest):
     raw_answer = rag_chain.invoke(question)
     try:
         parsed = json.loads(raw_answer)
+        
+        # Handle different response types
+        if parsed.get("type") == "general_info":
+            # For general information questions, don't include products
+            response = {
+                "question": question,
+                "message": parsed["message"],
+                "products": [],
+                "audio_file": None
+            }
+        else:
+            # For product search requests
+            response = {
+                "question": question,
+                "message": parsed["message"],
+                "products": parsed.get("products", []),
+                "audio_file": None
+            }
+            
+            # Ensure the message reflects the query for product searches
+            if "under" in question.lower() and "$" in question:
+                try:
+                    price = float(question.lower().split("under $")[1].split()[0])
+                    response["message"] = f"Here are the best phones under ${price}..."
+                except:
+                    pass  # Keep default message if price parsing fails
+                    
     except json.JSONDecodeError:
-        parsed = {
+        response = {
+            "question": question,
             "message": "Sorry, I couldn't process the response properly.",
-            "products": []
+            "products": [],
+            "audio_file": None
         }
 
-    # Ensure the message reflects the query
-    if "under" in question.lower() and "$" in question:
-        try:
-            price = float(question.lower().split("under $")[1].split()[0])
-            parsed["message"] = f"Here are the best phones under ${price}..."
-        except:
-            pass  # Keep default message if price parsing fails
-
-    # Add question and audio_file to the response
-    parsed["question"] = question
-    parsed["audio_file"] = generate_audio_response(parsed["message"])
-    return parsed
+    # Generate audio for the response message
+    response["audio_file"] = generate_audio_response(response["message"])
+    return response
 
 @app.get("/")
 async def root():
