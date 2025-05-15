@@ -204,15 +204,16 @@ def generate_response(state):
         }
     
     # Run RAG with chat history and parse the response
+    # Fix: Use the prompt directly in the chain instead of calling invoke()
     response = (
-        prompt.invoke({
-            'context': context,
-            'question': question,
-            'chat_history': chat_history
-        })
+        prompt
         | model
         | StrOutputParser()
-    ).invoke({})
+    ).invoke({
+        'context': context,
+        'question': question,
+        'chat_history': chat_history
+    })
     
     try:
         parsed = json.loads(response)
