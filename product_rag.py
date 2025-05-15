@@ -15,8 +15,13 @@ from dotenv import load_dotenv
 import json
 import os
 import uuid
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
+
+# LangGraph imports for memory persistence
+from langgraph.graph import END, StateGraph
+from langgraph.checkpoint import MemorySaver
+from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
 
 # Load environment variables
 load_dotenv()
@@ -40,60 +45,6 @@ app.add_middleware(
 class QuestionRequest(BaseModel):
     question: str
     session_id: Optional[str] = None
-
-class ChatMessage(BaseModel):
-    role: str  # "user" or "assistant"
-    content: str
-    timestamp: datetime
-
-class ChatSession:
-    def __init__(self, session_id: str):
-        self.session_id = session_id
-        self.messages: List[ChatMessage] = []
-        self.last_activity = datetime.now()
-    
-    def add_message(self, role: str, content: str):
-        self.messages.append(ChatMessage(
-            role=role,
-            content=content,
-            timestamp=datetime.now()
-        ))
-        self.last_activity = datetime.now()
-    
-    def get_conversation_history(self, max_messages: int = 5) -> str:
-        """Return the conversation history formatted for the prompt"""
-        recent_messages = self.messages[-max_messages:] if len(self.messages) > max_messages else self.messages
-        formatted_history = ""
-        for msg in recent_messages:
-            formatted_history += f"{msg.role.capitalize()}: {msg.content}\n"
-        return formatted_history
-
-# Chat session storage
-chat_sessions: Dict[str, ChatSession] = {}
-
-# Session cleanup function
-def cleanup_old_sessions(max_age_hours: int = 24):
-    current_time = datetime.now()
-    expired_sessions = []
-    for session_id, session in chat_sessions.items():
-        if current_time - session.last_activity > timedelta(hours=max_age_hours):
-            expired_sessions.append(session_id)
-    
-    for session_id in expired_sessions:
-        del chat_sessions[session_id]
-
-# Get or create chat session
-def get_chat_session(session_id: Optional[str] = None) -> ChatSession:
-    # Clean up old sessions periodically
-    if len(chat_sessions) > 100:  # Arbitrary threshold
-        cleanup_old_sessions()
-    
-    if not session_id or session_id not in chat_sessions:
-        new_session_id = session_id or str(uuid.uuid4())
-        chat_sessions[new_session_id] = ChatSession(new_session_id)
-        return chat_sessions[new_session_id]
-    
-    return chat_sessions[session_id]
 
 # Load all product data
 with open("smartphones_usd_rounded.json", "r", encoding="utf-8") as f:
@@ -174,17 +125,121 @@ Current Question: {question}
     input_variables=['context', 'question', 'chat_history']
 )
 
-def rag_chain_with_history(question: str, chat_history: str):
-    return (
-        RunnableParallel({
-            'context': retriever | RunnableLambda(format_docs),
-            'question': RunnablePassthrough(),
-            'chat_history': RunnableLambda(lambda _: chat_history)
+# Define the state for our LangGraph
+class ChatState(dict):
+    """State for the chat graph."""
+    
+    def __init__(self, 
+                 messages: Optional[List[BaseMessage]] = None,
+                 question: Optional[str] = None,
+                 context: Optional[str] = None):
+        self.messages = messages or []
+        self.question = question
+        self.context = context
+        super().__init__(messages=self.messages, question=self.question, context=self.context)
+    
+    def __getattr__(self, key):
+        if key in self:
+            return self[key]
+        raise AttributeError(f"'ChatState' object has no attribute '{key}'")
+    
+    def __setattr__(self, key, val):
+        self[key] = val
+
+# Create memory saver for persistence
+memory_saver = MemorySaver()
+
+# Define the nodes for our graph
+def retrieve_context(state: ChatState) -> ChatState:
+    """Retrieve context from the vector store."""
+    question = state.question
+    context = format_docs(retriever.invoke(question))
+    state.context = context
+    return state
+
+def format_chat_history(state: ChatState) -> str:
+    """Format the chat history for the prompt."""
+    formatted_history = ""
+    for message in state.messages[-5:]:  # Get last 5 messages
+        if isinstance(message, HumanMessage):
+            formatted_history += f"User: {message.content}\n"
+        elif isinstance(message, AIMessage):
+            formatted_history += f"Assistant: {message.content}\n"
+    return formatted_history
+
+def generate_response(state: ChatState) -> ChatState:
+    """Generate a response using the LLM."""
+    chat_history = format_chat_history(state)
+    
+    # Direct product lookup if question is a number (id)
+    if state.question.isdigit() and state.question in products_by_id:
+        product = products_by_id[state.question]
+        response_message = f"Here is the product with ID {state.question}:"
+        
+        # Add assistant response to chat history
+        state.messages.append(AIMessage(content=response_message))
+        state.response = {
+            "question": state.question,
+            "message": response_message,
+            "products": [product],
+            "audio_file": None
+        }
+        return state
+    
+    # Run RAG with chat history and parse the response
+    response = (
+        prompt.invoke({
+            'context': state.context,
+            'question': state.question,
+            'chat_history': chat_history
         })
-        | prompt
         | model
         | StrOutputParser()
-    ).invoke(question)
+    ).invoke({})
+    
+    try:
+        parsed = json.loads(response)
+        
+        # Handle different response types
+        if parsed.get("type") == "general_info":
+            # For general information questions, don't include products
+            state.response = {
+                "question": state.question,
+                "message": parsed["message"],
+                "products": [],
+                "audio_file": None
+            }
+        else:
+            # For product search requests
+            state.response = {
+                "question": state.question,
+                "message": parsed["message"],
+                "products": parsed.get("products", []),
+                "audio_file": None
+            }
+            
+            # Ensure the message reflects the query for product searches
+            if "under" in state.question.lower() and "$" in state.question:
+                try:
+                    price = float(state.question.lower().split("under $")[1].split()[0])
+                    state.response["message"] = f"Here are the best phones under ${price}..."
+                except:
+                    pass  # Keep default message if price parsing fails
+                    
+    except json.JSONDecodeError:
+        state.response = {
+            "question": state.question,
+            "message": "Sorry, I couldn't process the response properly.",
+            "products": [],
+            "audio_file": None
+        }
+    
+    # Add assistant response to chat history
+    state.messages.append(AIMessage(content=state.response["message"]))
+    
+    # Generate audio for the response message
+    state.response["audio_file"] = generate_audio_response(state.response["message"])
+    return state
 
 def generate_audio_response(text):
     if not client:
@@ -205,83 +260,61 @@ def generate_audio_response(text):
     except:
         return None
 
+# Build the graph
+def build_graph():
+    workflow = StateGraph(ChatState)
+    
+    # Add nodes
+    workflow.add_node("retrieve_context", retrieve_context)
+    workflow.add_node("generate_response", generate_response)
+    
+    # Add edges
+    workflow.add_edge("retrieve_context", "generate_response")
+    workflow.add_edge("generate_response", END)
+    
+    # Set entry point
+    workflow.set_entry_point("retrieve_context")
+    
+    # Compile the graph
+    return workflow.compile()
+
+# Create the graph
+graph = build_graph()
+
+# Dictionary to store session IDs to thread IDs mapping
+session_to_thread = {}
+
 @app.post("/ask", response_model=dict)
 async def ask_question(request: QuestionRequest):
     question = request.question.strip()
+    session_id = request.session_id or str(uuid.uuid4())
     
-    # Get or create chat session
-    session = get_chat_session(request.session_id)
+    # Get or create thread ID for this session
+    thread_id = session_to_thread.get(session_id)
     
-    # Add user message to chat history
-    session.add_message("user", question)
+    # Initialize state
+    if thread_id:
+        # Get existing state from memory saver
+        config = {"configurable": {"thread_id": thread_id}}
+        state = memory_saver.get_state(thread_id) or ChatState()
+    else:
+        # Create new thread ID and state
+        thread_id = str(uuid.uuid4())
+        session_to_thread[session_id] = thread_id
+        config = {"configurable": {"thread_id": thread_id}}
+        state = ChatState()
     
-    # Direct product lookup if question is a number (id)
-    if question.isdigit() and question in products_by_id:
-        product = products_by_id[question]
-        response_message = f"Here is the product with ID {question}:"
-        
-        # Add assistant response to chat history
-        session.add_message("assistant", response_message)
-        
-        return {
-            "question": question,
-            "message": response_message,
-            "products": [product],
-            "audio_file": None,
-            "session_id": session.session_id
-        }
-
-    # Get conversation history
-    chat_history = session.get_conversation_history()
+    # Add user message to state
+    state.messages.append(HumanMessage(content=question))
+    state.question = question
     
-    # Run RAG with chat history and parse the response
-    raw_answer = rag_chain_with_history(question, chat_history)
-    try:
-        parsed = json.loads(raw_answer)
-        
-        # Handle different response types
-        if parsed.get("type") == "general_info":
-            # For general information questions, don't include products
-            response = {
-                "question": question,
-                "message": parsed["message"],
-                "products": [],
-                "audio_file": None,
-                "session_id": session.session_id
-            }
-        else:
-            # For product search requests
-            response = {
-                "question": question,
-                "message": parsed["message"],
-                "products": parsed.get("products", []),
-                "audio_file": None,
-                "session_id": session.session_id
-            }
-            
-            # Ensure the message reflects the query for product searches
-            if "under" in question.lower() and "$" in question:
-                try:
-                    price = float(question.lower().split("under $")[1].split()[0])
-                    response["message"] = f"Here are the best phones under ${price}..."
-                except:
-                    pass  # Keep default message if price parsing fails
-                    
-    except json.JSONDecodeError:
-        response = {
-            "question": question,
-            "message": "Sorry, I couldn't process the response properly.",
-            "products": [],
-            "audio_file": None,
-            "session_id": session.session_id
-        }
-
-    # Add assistant response to chat history
-    session.add_message("assistant", response["message"])
+    # Run the graph with the state
+    result = graph.invoke(state, config=config)
     
-    # Generate audio for the response message
-    response["audio_file"] = generate_audio_response(response["message"])
-    return response
+    # Add session_id to response
+    result.response["session_id"] = session_id
+    
+    return result.response
 
 @app.get("/")
 async def root():
@@ -303,8 +336,10 @@ async def get_audio(filename: str):
 # New endpoint to clear chat history
 @app.post("/clear-chat")
 async def clear_chat(session_id: str):
-    if session_id in chat_sessions:
-        del chat_sessions[session_id]
+    if session_id in session_to_thread:
+        thread_id = session_to_thread[session_id]
+        memory_saver.delete_state(thread_id)
+        del session_to_thread[session_id]
     return {"message": "Chat history cleared", "session_id": session_id}
 
 if __name__ == "__main__":

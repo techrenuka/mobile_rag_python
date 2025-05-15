@@ -6,6 +6,7 @@ pydantic
 langchain
 langchain-community
 langchain-core
+langgraph
 langchain-google-genai
 faiss-cpu
 requests
