@@ -19,8 +19,8 @@ from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
 
 # LangGraph imports for memory persistence
-from langgraph.graph import END, StateGraph
-from langgraph.checkpoint import MemorySaver
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import START, MessagesState, StateGraph
 from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
 
 # Load environment variables
@@ -262,21 +262,19 @@ def generate_audio_response(text):
 
 # Build the graph
 def build_graph():
-    workflow = StateGraph(ChatState)
+    workflow = StateGraph(state_schema=MessagesState)
     
     # Add nodes
     workflow.add_node("retrieve_context", retrieve_context)
     workflow.add_node("generate_response", generate_response)
     
     # Add edges
+    workflow.add_edge(START, "retrieve_context")
     workflow.add_edge("retrieve_context", "generate_response")
     workflow.add_edge("generate_response", END)
     
-    # Set entry point
-    workflow.set_entry_point("retrieve_context")
-    
-    # Compile the graph
-    return workflow.compile()
+    # Compile the graph with checkpointer
+    return workflow.compile(checkpointer=memory_saver)
 
 # Create the graph
 graph = build_graph()
@@ -292,29 +290,30 @@ async def ask_question(request: QuestionRequest):
     # Get or create thread ID for this session
     thread_id = session_to_thread.get(session_id)
     
-    # Initialize state
-    if thread_id:
-        # Get existing state from memory saver
-        config = {"configurable": {"thread_id": thread_id}}
-        state = memory_saver.get_state(thread_id) or ChatState()
-    else:
-        # Create new thread ID and state
-        thread_id = str(uuid.uuid4())
-        session_to_thread[session_id] = thread_id
-        config = {"configurable": {"thread_id": thread_id}}
-        state = ChatState()
+    # Create config with thread_id
+    config = {"configurable": {"thread_id": thread_id or str(uuid.uuid4())}}
     
-    # Add user message to state
-    state.messages.append(HumanMessage(content=question))
-    state.question = question
+    # If this is a new session, store the thread ID
+    if not thread_id:
+        thread_id = config["configurable"]["thread_id"]
+        session_to_thread[session_id] = thread_id
+    
+    # Create initial state with the user's question
+    messages = [HumanMessage(content=question)]
     
     # Run the graph with the state
-    result = graph.invoke(state, config=config)
+    result = graph.invoke({"messages": messages, "question": question}, config=config)
     
-    # Add session_id to response
-    result.response["session_id"] = session_id
+    # Format the response
+    response = {
+        "question": question,
+        "message": result["messages"][-1].content if result["messages"] else "No response generated",
+        "products": result.get("products", []),
+        "audio_file": generate_audio_response(result["messages"][-1].content if result["messages"] else ""),
+        "session_id": session_id
+    }
     
-    return result.response
+    return response
 
 @app.get("/")
 async def root():
@@ -338,7 +337,8 @@ async def get_audio(filename: str):
 async def clear_chat(session_id: str):
     if session_id in session_to_thread:
         thread_id = session_to_thread[session_id]
-        memory_saver.delete_state(thread_id)
+        # The documentation suggests this is the correct method name
+        memory_saver.delete(thread_id)
         del session_to_thread[session_id]
     return {"message": "Chat history cleared", "session_id": session_id}
 
