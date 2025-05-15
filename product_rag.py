@@ -150,47 +150,59 @@ class ChatState(dict):
 memory_saver = MemorySaver()
 
 # Define the nodes for our graph
-def retrieve_context(state: ChatState) -> ChatState:
+def retrieve_context(state):
     """Retrieve context from the vector store."""
-    question = state.question
+    # Extract question from the last message
+    question = state["messages"][-1].content if state["messages"] else ""
     context = format_docs(retriever.invoke(question))
-    state.context = context
-    return state
+    # Return a new state with context added
+    return {"messages": state["messages"], "context": context, "question": question}
 
-def format_chat_history(state: ChatState) -> str:
+def format_chat_history(messages):
     """Format the chat history for the prompt."""
     formatted_history = ""
-    for message in state.messages[-5:]:  # Get last 5 messages
+    for message in messages[-5:]:  # Get last 5 messages
         if isinstance(message, HumanMessage):
             formatted_history += f"User: {message.content}\n"
         elif isinstance(message, AIMessage):
             formatted_history += f"Assistant: {message.content}\n"
     return formatted_history
 
-def generate_response(state: ChatState) -> ChatState:
+def generate_response(state):
     """Generate a response using the LLM."""
-    chat_history = format_chat_history(state)
+    messages = state["messages"]
+    question = state["question"]
+    context = state.get("context", "")
+    chat_history = format_chat_history(messages)
     
     # Direct product lookup if question is a number (id)
-    if state.question.isdigit() and state.question in products_by_id:
-        product = products_by_id[state.question]
-        response_message = f"Here is the product with ID {state.question}:"
+    if question.isdigit() and question in products_by_id:
+        product = products_by_id[question]
+        response_message = f"Here is the product with ID {question}:"
         
-        # Add assistant response to chat history
-        state.messages.append(AIMessage(content=response_message))
-        state.response = {
-            "question": state.question,
-            "message": response_message,
+        # Create new messages list with the response
+        new_messages = messages.copy()
+        new_messages.append(AIMessage(content=response_message))
+        
+        # Return updated state
+        return {
+            "messages": new_messages,
+            "context": context,
+            "question": question,
             "products": [product],
-            "audio_file": None
+            "response": {
+                "question": question,
+                "message": response_message,
+                "products": [product],
+                "audio_file": None
+            }
         }
-        return state
     
     # Run RAG with chat history and parse the response
     response = (
         prompt.invoke({
-            'context': state.context,
-            'question': state.question,
+            'context': context,
+            'question': question,
             'chat_history': chat_history
         })
         | model
@@ -203,43 +215,51 @@ def generate_response(state: ChatState) -> ChatState:
         # Handle different response types
         if parsed.get("type") == "general_info":
             # For general information questions, don't include products
-            state.response = {
-                "question": state.question,
+            response_data = {
+                "question": question,
                 "message": parsed["message"],
                 "products": [],
                 "audio_file": None
             }
         else:
             # For product search requests
-            state.response = {
-                "question": state.question,
+            response_data = {
+                "question": question,
                 "message": parsed["message"],
                 "products": parsed.get("products", []),
                 "audio_file": None
             }
             
             # Ensure the message reflects the query for product searches
-            if "under" in state.question.lower() and "$" in state.question:
+            if "under" in question.lower() and "$" in question:
                 try:
-                    price = float(state.question.lower().split("under $")[1].split()[0])
-                    state.response["message"] = f"Here are the best phones under ${price}..."
+                    price = float(question.lower().split("under $")[1].split()[0])
+                    response_data["message"] = f"Here are the best phones under ${price}..."
                 except:
                     pass  # Keep default message if price parsing fails
                     
     except json.JSONDecodeError:
-        state.response = {
-            "question": state.question,
+        response_data = {
+            "question": question,
             "message": "Sorry, I couldn't process the response properly.",
             "products": [],
             "audio_file": None
         }
     
-    # Add assistant response to chat history
-    state.messages.append(AIMessage(content=state.response["message"]))
+    # Create new messages list with the response
+    new_messages = messages.copy()
+    new_messages.append(AIMessage(content=response_data["message"]))
     
     # Generate audio for the response message
-    state.response["audio_file"] = generate_audio_response(state.response["message"])
-    return state
+    response_data["audio_file"] = generate_audio_response(response_data["message"])
+    
+    # Return updated state
+    return {
+        "messages": new_messages,
+        "context": context,
+        "question": question,
+        "response": response_data
+    }
 
 def generate_audio_response(text):
     if not client:
@@ -302,16 +322,20 @@ async def ask_question(request: QuestionRequest):
     messages = [HumanMessage(content=question)]
     
     # Run the graph with the state
-    result = graph.invoke({"messages": messages, "question": question}, config=config)
+    result = graph.invoke({"messages": messages}, config=config)
     
     # Format the response
-    response = {
-        "question": question,
-        "message": result["messages"][-1].content if result["messages"] else "No response generated",
-        "products": result.get("products", []),
-        "audio_file": generate_audio_response(result["messages"][-1].content if result["messages"] else ""),
-        "session_id": session_id
-    }
+    response = result.get("response", {})
+    if not response:
+        response = {
+            "question": question,
+            "message": "No response generated",
+            "products": [],
+            "audio_file": None,
+            "session_id": session_id
+        }
+    else:
+        response["session_id"] = session_id
     
     return response
 
