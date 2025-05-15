@@ -171,7 +171,12 @@ def format_chat_history(messages):
 def generate_response(state):
     """Generate a response using the LLM."""
     messages = state["messages"]
-    question = state["question"]
+    # Check if question exists in state, otherwise extract from last message
+    if "question" not in state:
+        question = messages[-1].content if messages else ""
+    else:
+        question = state["question"]
+    
     context = state.get("context", "")
     chat_history = format_chat_history(messages)
     
