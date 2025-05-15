@@ -147,27 +147,27 @@ For follow-up questions:
 - Always maintain context from previous messages and provide precise information
 
 For product search requests, respond in JSON format with the following structure:
-{
+{{
     "type": "product_search",
     "message": "Here are the best phones under $500...",
     "products": [
-        {
+        {{
             "id": int,
             "brand_name": "string",
             "model": "string",
             "price": float,
             "rating": float,
-            "imgs": {"thumbnails": ["url1", "url2"]}
-        },
+            "imgs": {{"thumbnails": ["url1", "url2"]}}
+        }},
         ...
     ]
-}
+}}
 
 For general questions or follow-ups, respond in JSON format with:
-{
+{{
     "type": "general_info",
     "message": "Your detailed answer about the phone or technology..."
-}
+}}
 
 Current Question: {question}
 """,
