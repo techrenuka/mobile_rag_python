@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 
 # LangGraph imports for memory persistence
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import START, MessagesState, StateGraph
+from langgraph.graph import START, END, MessagesState, StateGraph
 from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
 
 # Load environment variables
