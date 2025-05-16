@@ -169,9 +169,7 @@ def format_chat_history(messages):
     return formatted_history
 
 def generate_response(state):
-    """Generate a response using the LLM."""
     messages = state["messages"]
-    # Check if question exists in state, otherwise extract from last message
     if "question" not in state:
         question = messages[-1].content if messages else ""
     else:
@@ -184,12 +182,8 @@ def generate_response(state):
     if question.isdigit() and question in products_by_id:
         product = products_by_id[question]
         response_message = f"Here is the product with ID {question}:"
-        
-        # Create new messages list with the response
         new_messages = messages.copy()
         new_messages.append(AIMessage(content=response_message))
-        
-        # Return updated state
         return {
             "messages": new_messages,
             "context": context,
@@ -204,23 +198,38 @@ def generate_response(state):
         }
     
     # Run RAG with chat history and parse the response
-    # Fix: Use the prompt directly in the chain instead of calling invoke()
-    response = (
-        prompt
-        | model
-        | StrOutputParser()
-    ).invoke({
-        'context': context,
-        'question': question,
-        'chat_history': chat_history
-    })
+    try:
+        response = (
+            prompt
+            | model
+            | StrOutputParser()
+        ).invoke({
+            'context': context,
+            'question': question,
+            'chat_history': chat_history
+        })
+    except Exception as e:
+        # Log the error for debugging
+        print(f"Error in LLM invocation: {str(e)}")
+        response_data = {
+            "question": question,
+            "message": f"Error generating response: {str(e)}",
+            "products": [],
+            "audio_file": None
+        }
+        new_messages = messages.copy()
+        new_messages.append(AIMessage(content=response_data["message"]))
+        return {
+            "messages": new_messages,
+            "context": context,
+            "question": question,
+            "response": response_data
+        }
     
+    # Continue with parsing as before
     try:
         parsed = json.loads(response)
-        
-        # Handle different response types
         if parsed.get("type") == "general_info":
-            # For general information questions, don't include products
             response_data = {
                 "question": question,
                 "message": parsed["message"],
@@ -228,22 +237,18 @@ def generate_response(state):
                 "audio_file": None
             }
         else:
-            # For product search requests
             response_data = {
                 "question": question,
                 "message": parsed["message"],
                 "products": parsed.get("products", []),
                 "audio_file": None
             }
-            
-            # Ensure the message reflects the query for product searches
             if "under" in question.lower() and "$" in question:
                 try:
                     price = float(question.lower().split("under $")[1].split()[0])
                     response_data["message"] = f"Here are the best phones under ${price}..."
                 except:
-                    pass  # Keep default message if price parsing fails
-                    
+                    pass
     except json.JSONDecodeError:
         response_data = {
             "question": question,
@@ -252,14 +257,10 @@ def generate_response(state):
             "audio_file": None
         }
     
-    # Create new messages list with the response
     new_messages = messages.copy()
     new_messages.append(AIMessage(content=response_data["message"]))
-    
-    # Generate audio for the response message
     response_data["audio_file"] = generate_audio_response(response_data["message"])
     
-    # Return updated state
     return {
         "messages": new_messages,
         "context": context,
@@ -308,31 +309,33 @@ graph = build_graph()
 # Dictionary to store session IDs to thread IDs mapping
 session_to_thread = {}
 
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 @app.post("/ask", response_model=dict)
 async def ask_question(request: QuestionRequest):
+    logger.info(f"Received question: {request.question}, session_id: {request.session_id}")
     question = request.question.strip()
     session_id = request.session_id or str(uuid.uuid4())
-    
-    # Get or create thread ID for this session
     thread_id = session_to_thread.get(session_id)
-    
-    # Create config with thread_id
     config = {"configurable": {"thread_id": thread_id or str(uuid.uuid4())}}
-    
-    # If this is a new session, store the thread ID
     if not thread_id:
         thread_id = config["configurable"]["thread_id"]
         session_to_thread[session_id] = thread_id
     
-    # Create initial state with the user's question
     messages = [HumanMessage(content=question)]
+    try:
+        result = graph.invoke({"messages": messages}, config=config)
+        logger.info(f"Graph result: {result}")
+    except Exception as e:
+        logger.error(f"Error in graph.invoke: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
     
-    # Run the graph with the state
-    result = graph.invoke({"messages": messages}, config=config)
-    
-    # Format the response
     response = result.get("response", {})
     if not response:
+        logger.warning("No response generated from graph")
         response = {
             "question": question,
             "message": "No response generated",
@@ -343,6 +346,7 @@ async def ask_question(request: QuestionRequest):
     else:
         response["session_id"] = session_id
     
+    logger.info(f"Returning response: {response}")
     return response
 
 @app.get("/")
