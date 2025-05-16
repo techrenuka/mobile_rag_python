@@ -1,6 +1,7 @@
-from fastapi import FastAPI, HTTPException, Response, Depends
+from fastapi import FastAPI, HTTPException, Response, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
@@ -17,14 +18,28 @@ import os
 import uuid
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
+import logging
 
 # LangGraph imports for memory persistence
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import START, END, MessagesState, StateGraph
 from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
 
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 # Load environment variables
 load_dotenv()
+
+# Validate API keys at startup
+xai_api_key = os.getenv("XAI_API_KEY")
+if not xai_api_key:
+    raise ValueError("XAI_API_KEY not found in environment variables")
+
+google_api_key = os.getenv("GOOGLE_API_KEY")
+if not google_api_key:
+    raise ValueError("GOOGLE_API_KEY not found in environment variables")
 
 # Initialize ElevenLabs client
 elevenlabs_api_key = os.getenv('ELEVENLABS_API_KEY')
@@ -42,6 +57,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Global exception handler
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Unhandled exception: {str(exc)}")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "question": request.state.question if hasattr(request.state, "question") else "Unknown",
+            "message": "Sorry, there was an error processing your request. Please try again later.",
+            "products": [],
+            "audio_file": None,
+            "session_id": request.state.session_id if hasattr(request.state, "session_id") else None
+        }
+    )
+
 class QuestionRequest(BaseModel):
     question: str
     session_id: Optional[str] = None
@@ -53,20 +83,35 @@ with open("smartphones_usd_rounded.json", "r", encoding="utf-8") as f:
 # Create a product dictionary by ID
 products_by_id = {str(p["id"]): p for p in all_products}
 
-# Create searchable RAG data
+# Create searchable RAG data with brand normalization
 def load_smartphone_text():
     texts = []
     for p in all_products:
-        txt = f"{p['brand_name']} {p['model']} for ${p['price']}, {p['os']}, {p['primary_camera_rear']}MP Rear, {p['ram_capacity']}GB RAM"
+        brand = p['brand_name']
+        if "iphone" in p['model'].lower():
+            brand = "Apple"  # Normalize iPhone models to Apple brand
+        txt = f"{brand} {p['model']} for ${p['price']}, {p['os']}, {p['primary_camera_rear']}MP Rear, {p['ram_capacity']}GB RAM"
         texts.append(txt)
     return "\n\n".join(texts)
 
 # Initialize RAG
-model = ChatXAI(model="grok-3-mini-beta")
+try:
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
+    embeddings.embed_query("test")  # Test embedding
+except Exception as e:
+    raise ValueError(f"Failed to initialize GoogleGenerativeAIEmbeddings: {str(e)}")
+
+# Initialize model with fallback
+try:
+    model = ChatXAI(model="grok-3")
+    model.invoke("test")  # Test model
+except Exception as e:
+    logger.warning(f"Failed to initialize grok-3: {str(e)}. Falling back to a different model if available.")
+    raise ValueError(f"Failed to initialize ChatXAI model: {str(e)}")
+
 content = load_smartphone_text()
 splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
 documents = splitter.create_documents([content])
-embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
 vector_store = FAISS.from_documents(documents, embeddings)
 retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 5})
 
@@ -152,10 +197,12 @@ memory_saver = MemorySaver()
 # Define the nodes for our graph
 def retrieve_context(state):
     """Retrieve context from the vector store."""
-    # Extract question from the last message
-    question = state["messages"][-1].content if state["messages"] else ""
-    context = format_docs(retriever.invoke(question))
-    # Return a new state with context added
+    try:
+        question = state["messages"][-1].content if state["messages"] else ""
+        context = format_docs(retriever.invoke(question))
+    except Exception as e:
+        logger.error(f"Error in retrieve_context: {str(e)}")
+        context = ""  # Fallback to empty context
     return {"messages": state["messages"], "context": context, "question": question}
 
 def format_chat_history(messages):
@@ -169,6 +216,7 @@ def format_chat_history(messages):
     return formatted_history
 
 def generate_response(state):
+    """Generate a response using the LLM."""
     messages = state["messages"]
     if "question" not in state:
         question = messages[-1].content if messages else ""
@@ -197,6 +245,23 @@ def generate_response(state):
             }
         }
     
+    # Handle empty context
+    if not context:
+        response_data = {
+            "question": question,
+            "message": "I couldn't find any relevant products in the catalog. Try a different query.",
+            "products": [],
+            "audio_file": None
+        }
+        new_messages = messages.copy()
+        new_messages.append(AIMessage(content=response_data["message"]))
+        return {
+            "messages": new_messages,
+            "context": context,
+            "question": question,
+            "response": response_data
+        }
+    
     # Run RAG with chat history and parse the response
     try:
         response = (
@@ -209,8 +274,7 @@ def generate_response(state):
             'chat_history': chat_history
         })
     except Exception as e:
-        # Log the error for debugging
-        print(f"Error in LLM invocation: {str(e)}")
+        logger.error(f"Error in LLM invocation: {str(e)}")
         response_data = {
             "question": question,
             "message": f"Error generating response: {str(e)}",
@@ -226,7 +290,6 @@ def generate_response(state):
             "response": response_data
         }
     
-    # Continue with parsing as before
     try:
         parsed = json.loads(response)
         if parsed.get("type") == "general_info":
@@ -284,23 +347,18 @@ def generate_audio_response(text):
         with open(audio_path, 'wb') as f:
             f.write(audio_bytes)
         return audio_filename
-    except:
+    except Exception as e:
+        logger.error(f"Error in audio generation: {str(e)}")
         return None
 
 # Build the graph
 def build_graph():
     workflow = StateGraph(state_schema=MessagesState)
-    
-    # Add nodes
     workflow.add_node("retrieve_context", retrieve_context)
     workflow.add_node("generate_response", generate_response)
-    
-    # Add edges
     workflow.add_edge(START, "retrieve_context")
     workflow.add_edge("retrieve_context", "generate_response")
     workflow.add_edge("generate_response", END)
-    
-    # Compile the graph with checkpointer
     return workflow.compile(checkpointer=memory_saver)
 
 # Create the graph
@@ -309,16 +367,15 @@ graph = build_graph()
 # Dictionary to store session IDs to thread IDs mapping
 session_to_thread = {}
 
-import logging
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 @app.post("/ask", response_model=dict)
 async def ask_question(request: QuestionRequest):
     logger.info(f"Received question: {request.question}, session_id: {request.session_id}")
-    question = request.question.strip()
-    session_id = request.session_id or str(uuid.uuid4())
+    request.state.question = request.question.strip()
+    request.state.session_id = request.session_id or str(uuid.uuid4())
+    
+    question = request.state.question
+    session_id = request.state.session_id
+    
     thread_id = session_to_thread.get(session_id)
     config = {"configurable": {"thread_id": thread_id or str(uuid.uuid4())}}
     if not thread_id:
@@ -366,12 +423,11 @@ async def get_audio(filename: str):
     with open(audio_path, "rb") as f:
         return Response(content=f.read(), media_type="audio/mpeg")
 
-# New endpoint to clear chat history
+# Endpoint to clear chat history
 @app.post("/clear-chat")
 async def clear_chat(session_id: str):
     if session_id in session_to_thread:
         thread_id = session_to_thread[session_id]
-        # The documentation suggests this is the correct method name
         memory_saver.delete(thread_id)
         del session_to_thread[session_id]
     return {"message": "Chat history cleared", "session_id": session_id}
