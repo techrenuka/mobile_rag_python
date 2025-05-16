@@ -1,7 +1,6 @@
-from fastapi import FastAPI, HTTPException, Response, Depends, Request
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
@@ -15,31 +14,9 @@ from elevenlabs import play
 from dotenv import load_dotenv
 import json
 import os
-import uuid
-from typing import List, Optional, Dict, Any
-from datetime import datetime, timedelta
-import logging
-
-# LangGraph imports for memory persistence
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import START, END, MessagesState, StateGraph
-from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
-
-# Validate API keys at startup
-xai_api_key = os.getenv("XAI_API_KEY")
-if not xai_api_key:
-    raise ValueError("XAI_API_KEY not found in environment variables")
-
-google_api_key = os.getenv("GOOGLE_API_KEY")
-if not google_api_key:
-    raise ValueError("GOOGLE_API_KEY not found in environment variables")
 
 # Initialize ElevenLabs client
 elevenlabs_api_key = os.getenv('ELEVENLABS_API_KEY')
@@ -57,24 +34,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global exception handler
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    logger.error(f"Unhandled exception: {str(exc)}")
-    return JSONResponse(
-        status_code=500,
-        content={
-            "question": request.state.question if hasattr(request.state, "question") else "Unknown",
-            "message": "Sorry, there was an error processing your request. Please try again later.",
-            "products": [],
-            "audio_file": None,
-            "session_id": request.state.session_id if hasattr(request.state, "session_id") else None
-        }
-    )
-
 class QuestionRequest(BaseModel):
     question: str
-    session_id: Optional[str] = None
 
 # Load all product data
 with open("smartphones_usd_rounded.json", "r", encoding="utf-8") as f:
@@ -83,64 +44,36 @@ with open("smartphones_usd_rounded.json", "r", encoding="utf-8") as f:
 # Create a product dictionary by ID
 products_by_id = {str(p["id"]): p for p in all_products}
 
-# Create searchable RAG data with brand normalization
+# Create searchable RAG data
 def load_smartphone_text():
     texts = []
     for p in all_products:
-        brand = p['brand_name']
-        if "iphone" in p['model'].lower():
-            brand = "Apple"  # Normalize iPhone models to Apple brand
-        txt = f"{brand} {p['model']} for ${p['price']}, {p['os']}, {p['primary_camera_rear']}MP Rear, {p['ram_capacity']}GB RAM"
+        txt = f"{p['brand_name']} {p['model']} for ${p['price']}, {p['os']}, {p['primary_camera_rear']}MP Rear, {p['ram_capacity']}GB RAM"
         texts.append(txt)
     return "\n\n".join(texts)
 
 # Initialize RAG
-try:
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
-    embeddings.embed_query("test")  # Test embedding
-except Exception as e:
-    raise ValueError(f"Failed to initialize GoogleGenerativeAIEmbeddings: {str(e)}")
-
-# Initialize model with fallback
-try:
-    model = ChatXAI(model="grok-3")
-    model.invoke("test")  # Test model
-except Exception as e:
-    logger.warning(f"Failed to initialize grok-3: {str(e)}. Falling back to a different model if available.")
-    raise ValueError(f"Failed to initialize ChatXAI model: {str(e)}")
-
+model = ChatXAI(model="grok-3-mini-beta")
 content = load_smartphone_text()
 splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
 documents = splitter.create_documents([content])
+embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
 vector_store = FAISS.from_documents(documents, embeddings)
 retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 5})
 
 def format_docs(docs):
     return "\n\n".join(doc.page_content for doc in docs)
 
-# Updated Prompt Template with conversation history
+# Updated Prompt Template
 prompt = PromptTemplate(
-    template="""You are MobileExpert AI, a smartphone product specialist. Help users find phones from the catalog or answer general questions about smartphones. 
-                Your goal is to provide accurate and helpful information about smartphones.
-                If the user asks about a specific phone, provide detailed information about that phone.
-                If the user asks about storage for a specific phone, provide the exact storage options for that model.
-                If the user asks about a feature, provide information about that feature.
+    template="""You are MobileExpert AI, a smartphone product specialist. Help users find phones from the catalog or answer general questions about smartphones.
 
 Context:
 {context}
 
-Conversation History:
-{chat_history}
-
 Analyze the question to determine if it's:
 1. A product search request (e.g., "show me phones under $500", "best gaming phones", etc.)
 2. A general question about phone features, specifications, or technology
-3. A follow-up question that refers to previous conversation
-
-For follow-up questions:
-- If the user is asking about a specific phone mentioned earlier, provide specific details about that phone
-- If the user asks about storage for a specific phone, provide the exact storage options for that model
-- Always maintain context from previous messages and provide precise information
 
 For product search requests, respond in JSON format with the following structure:
 {{
@@ -159,177 +92,26 @@ For product search requests, respond in JSON format with the following structure
     ]
 }}
 
-For general questions or follow-ups, respond in JSON format with:
+For general questions, respond in JSON format with:
 {{
     "type": "general_info",
     "message": "Your detailed answer about the phone or technology..."
 }}
 
-Current Question: {question}
+Question: {question}
 """,
-    input_variables=['context', 'question', 'chat_history']
+    input_variables=['context', 'question']
 )
 
-# Define the state for our LangGraph
-class ChatState(dict):
-    """State for the chat graph."""
-    
-    def __init__(self, 
-                 messages: Optional[List[BaseMessage]] = None,
-                 question: Optional[str] = None,
-                 context: Optional[str] = None):
-        self.messages = messages or []
-        self.question = question
-        self.context = context
-        super().__init__(messages=self.messages, question=self.question, context=self.context)
-    
-    def __getattr__(self, key):
-        if key in self:
-            return self[key]
-        raise AttributeError(f"'ChatState' object has no attribute '{key}'")
-    
-    def __setattr__(self, key, val):
-        self[key] = val
-
-# Create memory saver for persistence
-memory_saver = MemorySaver()
-
-# Define the nodes for our graph
-def retrieve_context(state):
-    """Retrieve context from the vector store."""
-    try:
-        question = state["messages"][-1].content if state["messages"] else ""
-        context = format_docs(retriever.invoke(question))
-    except Exception as e:
-        logger.error(f"Error in retrieve_context: {str(e)}")
-        context = ""  # Fallback to empty context
-    return {"messages": state["messages"], "context": context, "question": question}
-
-def format_chat_history(messages):
-    """Format the chat history for the prompt."""
-    formatted_history = ""
-    for message in messages[-5:]:  # Get last 5 messages
-        if isinstance(message, HumanMessage):
-            formatted_history += f"User: {message.content}\n"
-        elif isinstance(message, AIMessage):
-            formatted_history += f"Assistant: {message.content}\n"
-    return formatted_history
-
-def generate_response(state):
-    """Generate a response using the LLM."""
-    messages = state["messages"]
-    if "question" not in state:
-        question = messages[-1].content if messages else ""
-    else:
-        question = state["question"]
-    
-    context = state.get("context", "")
-    chat_history = format_chat_history(messages)
-    
-    # Direct product lookup if question is a number (id)
-    if question.isdigit() and question in products_by_id:
-        product = products_by_id[question]
-        response_message = f"Here is the product with ID {question}:"
-        new_messages = messages.copy()
-        new_messages.append(AIMessage(content=response_message))
-        return {
-            "messages": new_messages,
-            "context": context,
-            "question": question,
-            "products": [product],
-            "response": {
-                "question": question,
-                "message": response_message,
-                "products": [product],
-                "audio_file": None
-            }
-        }
-    
-    # Handle empty context
-    if not context:
-        response_data = {
-            "question": question,
-            "message": "I couldn't find any relevant products in the catalog. Try a different query.",
-            "products": [],
-            "audio_file": None
-        }
-        new_messages = messages.copy()
-        new_messages.append(AIMessage(content=response_data["message"]))
-        return {
-            "messages": new_messages,
-            "context": context,
-            "question": question,
-            "response": response_data
-        }
-    
-    # Run RAG with chat history and parse the response
-    try:
-        response = (
-            prompt
-            | model
-            | StrOutputParser()
-        ).invoke({
-            'context': context,
-            'question': question,
-            'chat_history': chat_history
-        })
-    except Exception as e:
-        logger.error(f"Error in LLM invocation: {str(e)}")
-        response_data = {
-            "question": question,
-            "message": f"Error generating response: {str(e)}",
-            "products": [],
-            "audio_file": None
-        }
-        new_messages = messages.copy()
-        new_messages.append(AIMessage(content=response_data["message"]))
-        return {
-            "messages": new_messages,
-            "context": context,
-            "question": question,
-            "response": response_data
-        }
-    
-    try:
-        parsed = json.loads(response)
-        if parsed.get("type") == "general_info":
-            response_data = {
-                "question": question,
-                "message": parsed["message"],
-                "products": [],
-                "audio_file": None
-            }
-        else:
-            response_data = {
-                "question": question,
-                "message": parsed["message"],
-                "products": parsed.get("products", []),
-                "audio_file": None
-            }
-            if "under" in question.lower() and "$" in question:
-                try:
-                    price = float(question.lower().split("under $")[1].split()[0])
-                    response_data["message"] = f"Here are the best phones under ${price}..."
-                except:
-                    pass
-    except json.JSONDecodeError:
-        response_data = {
-            "question": question,
-            "message": "Sorry, I couldn't process the response properly.",
-            "products": [],
-            "audio_file": None
-        }
-    
-    new_messages = messages.copy()
-    new_messages.append(AIMessage(content=response_data["message"]))
-    response_data["audio_file"] = generate_audio_response(response_data["message"])
-    
-    return {
-        "messages": new_messages,
-        "context": context,
-        "question": question,
-        "response": response_data
-    }
+rag_chain = (
+    RunnableParallel({
+        'context': retriever | RunnableLambda(format_docs),
+        'question': RunnablePassthrough()
+    })
+    | prompt
+    | model
+    | StrOutputParser()
+)
 
 def generate_audio_response(text):
     if not client:
@@ -347,63 +129,64 @@ def generate_audio_response(text):
         with open(audio_path, 'wb') as f:
             f.write(audio_bytes)
         return audio_filename
-    except Exception as e:
-        logger.error(f"Error in audio generation: {str(e)}")
+    except:
         return None
-
-# Build the graph
-def build_graph():
-    workflow = StateGraph(state_schema=MessagesState)
-    workflow.add_node("retrieve_context", retrieve_context)
-    workflow.add_node("generate_response", generate_response)
-    workflow.add_edge(START, "retrieve_context")
-    workflow.add_edge("retrieve_context", "generate_response")
-    workflow.add_edge("generate_response", END)
-    return workflow.compile(checkpointer=memory_saver)
-
-# Create the graph
-graph = build_graph()
-
-# Dictionary to store session IDs to thread IDs mapping
-session_to_thread = {}
 
 @app.post("/ask", response_model=dict)
 async def ask_question(request: QuestionRequest):
-    logger.info(f"Received question: {request.question}, session_id: {request.session_id}")
-    request.state.question = request.question.strip()
-    request.state.session_id = request.session_id or str(uuid.uuid4())
-    
-    question = request.state.question
-    session_id = request.state.session_id
-    
-    thread_id = session_to_thread.get(session_id)
-    config = {"configurable": {"thread_id": thread_id or str(uuid.uuid4())}}
-    if not thread_id:
-        thread_id = config["configurable"]["thread_id"]
-        session_to_thread[session_id] = thread_id
-    
-    messages = [HumanMessage(content=question)]
+    question = request.question.strip()
+
+    # Direct product lookup if question is a number (id)
+    if question.isdigit() and question in products_by_id:
+        product = products_by_id[question]
+        return {
+            "question": question,
+            "message": f"Here is the product with ID {question}:",
+            "products": [product],
+            "audio_file": None
+        }
+
+    # Run RAG and parse the response
+    raw_answer = rag_chain.invoke(question)
     try:
-        result = graph.invoke({"messages": messages}, config=config)
-        logger.info(f"Graph result: {result}")
-    except Exception as e:
-        logger.error(f"Error in graph.invoke: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal server error")
-    
-    response = result.get("response", {})
-    if not response:
-        logger.warning("No response generated from graph")
+        parsed = json.loads(raw_answer)
+        
+        # Handle different response types
+        if parsed.get("type") == "general_info":
+            # For general information questions, don't include products
+            response = {
+                "question": question,
+                "message": parsed["message"],
+                "products": [],
+                "audio_file": None
+            }
+        else:
+            # For product search requests
+            response = {
+                "question": question,
+                "message": parsed["message"],
+                "products": parsed.get("products", []),
+                "audio_file": None
+            }
+            
+            # Ensure the message reflects the query for product searches
+            if "under" in question.lower() and "$" in question:
+                try:
+                    price = float(question.lower().split("under $")[1].split()[0])
+                    response["message"] = f"Here are the best phones under ${price}..."
+                except:
+                    pass  # Keep default message if price parsing fails
+                    
+    except json.JSONDecodeError:
         response = {
             "question": question,
-            "message": "No response generated",
+            "message": "Sorry, I couldn't process the response properly.",
             "products": [],
-            "audio_file": None,
-            "session_id": session_id
+            "audio_file": None
         }
-    else:
-        response["session_id"] = session_id
-    
-    logger.info(f"Returning response: {response}")
+
+    # Generate audio for the response message
+    response["audio_file"] = generate_audio_response(response["message"])
     return response
 
 @app.get("/")
@@ -422,15 +205,6 @@ async def get_audio(filename: str):
         raise HTTPException(status_code=404, detail="Audio not found")
     with open(audio_path, "rb") as f:
         return Response(content=f.read(), media_type="audio/mpeg")
-
-# Endpoint to clear chat history
-@app.post("/clear-chat")
-async def clear_chat(session_id: str):
-    if session_id in session_to_thread:
-        thread_id = session_to_thread[session_id]
-        memory_saver.delete(thread_id)
-        del session_to_thread[session_id]
-    return {"message": "Chat history cleared", "session_id": session_id}
 
 if __name__ == "__main__":
     import uvicorn
