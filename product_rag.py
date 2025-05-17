@@ -81,7 +81,6 @@ For product search requests, respond in JSON format with the following structure
     "message": "Here are the best phones under $500...",
     "products": [
         {{
-            "id": int,
             "brand_name": "string",
             "model": "string",
             "price": float,
